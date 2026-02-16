@@ -1,0 +1,331 @@
+
+
+/**
+ * main.c
+ */
+// q-dac not working properly
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "tm4c123gh6pm.h"
+#include "clock.h"
+#include "gpio.h"
+#include "spi0.h"
+#include "spi1.h"
+#include "uart0.h"
+#include "string.h"
+#include "clock80.h"
+#include "wait.h"
+
+// LDAC Bitband Alias
+//#define LDAC (*((volatile uint32_t *)(0x42000000 + (0x400063FC-0x40000000)*32 + 4*4)))
+#define LDAC_PORT PORTC,4
+
+
+// Constants
+#define FCYC 80e6
+#define FDAC 20e6
+
+
+// DAC Control Constants
+#define DAC_A 0x3000  // Channel A select, unbuffered, 1x gain, active
+#define DAC_B 0xB000  // Channel B select, unbuffered, 1x gain, active
+
+// Global variables for DAC values
+uint16_t i_value = 2048;  // Start at mid-scale
+uint16_t q_value = 2048;
+
+USER_DATA data;
+
+//-----------------------------------------------------------------------------
+// Function to send value to DAC
+//-----------------------------------------------------------------------------
+void writeDacA(uint16_t value)
+{
+
+    uint16_t command;
+
+    // Limit to 12 bits
+    if (value > 4095)
+        value = 4095;
+
+    // Build command: Channel A, Unbuffered, 1x gain, Active, 12-bit value
+    command = DAC_A | (value & 0x0FFF);
+
+    // Send via SPI
+    SSI0_DR_R = command;
+
+}
+
+void writeDacB(uint16_t value)
+{
+
+
+    uint16_t command;
+
+    // Limit to 12 bits
+    if (value > 4095)
+        value = 4095;
+
+    // Build command: Channel B, Unbuffered, 1x gain, Active, 12-bit value
+    command = DAC_B & (!value | 0x0FFF);
+
+    // Send via SPI
+    SSI0_DR_R = command;
+
+}
+
+void updateDAC()
+{
+    writeDacA(i_value);
+    writeDacB(q_value);
+
+    // Toggle LDAC to latch data
+        setPinValue(LDAC_PORT, 0);
+        setPinValue(LDAC_PORT, 1);
+
+    putsUart0("DAC updated: I=");
+
+    // Simple int to string
+    char buffer[10];
+    int temp = i_value;
+    int pos = 0;
+    if (temp == 0) {
+        buffer[pos++] = '0';
+    } else {
+        char rev[10];
+        int rpos = 0;
+        while (temp > 0) {
+            rev[rpos++] = '0' + (temp % 10);
+            temp /= 10;
+        }
+        while (rpos > 0) {
+            buffer[pos++] = rev[--rpos];
+        }
+    }
+    buffer[pos] = '\0';
+    putsUart0(buffer);
+
+    putsUart0(", Q=");
+
+    temp = q_value;
+    pos = 0;
+    if (temp == 0) {
+        buffer[pos++] = '0';
+    } else {
+        char rev[10];
+        int rpos = 0;
+        while (temp > 0) {
+            rev[rpos++] = '0' + (temp % 10);
+            temp /= 10;
+        }
+        while (rpos > 0) {
+            buffer[pos++] = rev[--rpos];
+        }
+    }
+    buffer[pos] = '\0';
+    putsUart0(buffer);
+    putsUart0("\n");
+}
+
+//-----------------------------------------------------------------------------
+// Command Handler
+//-----------------------------------------------------------------------------
+void handleCommand()
+{
+    getsUart0(&data);
+    parseFields(&data);
+
+    if (isCommand(&data, "set", 2))
+    {
+        // Command: set <I> <Q>
+        i_value = getFieldInteger(&data, 1);
+        q_value = getFieldInteger(&data, 2);
+
+        // Clamp to valid range
+        if (i_value > 4095) i_value = 4095;
+        if (q_value > 4095) q_value = 4095;
+
+        updateDAC();
+    }
+    else if (isCommand(&data, "i", 1))
+    {
+        // Command: i <value>
+        i_value = getFieldInteger(&data, 1);
+        if (i_value > 4095) i_value = 4095;
+        updateDAC();
+    }
+    else if (isCommand(&data, "q", 1))
+    {
+        // Command: q <value>
+        q_value = getFieldInteger(&data, 1);
+        if (q_value > 4095) q_value = 4095;
+        updateDAC();
+    }
+    else if (isCommand(&data, "mid", 0))
+    {
+        i_value = 2048;
+        q_value = 2048;
+        putsUart0("Set to mid-scale (2048)\n");
+        updateDAC();
+    }
+    else if (isCommand(&data, "min", 0))
+    {
+        i_value = 0;
+        q_value = 0;
+        putsUart0("Set to minimum (0)\n");
+        updateDAC();
+    }
+    else if (isCommand(&data, "max", 0))
+    {
+        i_value = 4095;
+        q_value = 4095;
+        putsUart0("Set to maximum (4095)\n");
+        updateDAC();
+    }
+    else if (isCommand(&data, "test", 0))
+    {
+        putsUart0("\n=== Running DAC Test Sequence ===\n");
+
+        putsUart0("Setting to 0...\n");
+        i_value = 0;
+        q_value = 0;
+        updateDAC();
+        waitMicrosecond(1000000);  // 1 second
+
+        putsUart0("Setting to 1024...\n");
+        i_value = 1024;
+        q_value = 1024;
+        updateDAC();
+        waitMicrosecond(1000000);
+
+        putsUart0("Setting to 2048...\n");
+        i_value = 2048;
+        q_value = 2048;
+        updateDAC();
+        waitMicrosecond(1000000);
+
+        putsUart0("Setting to 3072...\n");
+        i_value = 3072;
+        q_value = 3072;
+        updateDAC();
+        waitMicrosecond(1000000);
+
+        putsUart0("Setting to 4095...\n");
+        i_value = 4095;
+        q_value = 4095;
+        updateDAC();
+
+        putsUart0("Test complete!\n\n");
+    }
+    else if (isCommand(&data, "spi", 0))
+    {
+        putsUart0("\n=== SPI Debug Test ===\n");
+        putsUart0("Sending test pattern...\n");
+
+        // Send a known pattern
+        SSI1_DR_R = 0xAAAA;
+        while (SSI1_SR_R & SSI_SR_BSY);
+        putsUart0("Sent: 0xAAAA\n");
+
+        SSI1_DR_R = 0x5555;
+        while (SSI1_SR_R & SSI_SR_BSY);
+        putsUart0("Sent: 0x5555\n");
+
+        // Send actual DAC commands
+        SSI1_DR_R = DAC_A | 2048;
+        while (SSI1_SR_R & SSI_SR_BSY);
+        putsUart0("Sent DAC A: 2048\n");
+
+        SSI1_DR_R = DAC_B | 2048;
+        while (SSI1_SR_R & SSI_SR_BSY);
+        putsUart0("Sent DAC B: 2048\n");
+
+        putsUart0("SPI test complete\n\n");
+    }
+    else if (isCommand(&data, "help", 0))
+    {
+        putsUart0("\n=== Ultra-Simple DAC Test ===\n");
+        putsUart0("Commands:\n");
+        putsUart0("  set <I> <Q>  - Set both channels (0-4095)\n");
+        putsUart0("  i <value>    - Set I channel\n");
+        putsUart0("  q <value>    - Set Q channel\n");
+        putsUart0("  mid          - Set to 2048 (mid-scale)\n");
+        putsUart0("  min          - Set to 0 (minimum)\n");
+        putsUart0("  max          - Set to 4095 (maximum)\n");
+        putsUart0("  test         - Run automatic test sequence\n");
+        putsUart0("  spi          - Test SPI communication\n");
+        putsUart0("  help         - Show this help\n");
+        putsUart0("\nNo timers - DAC updates immediately on command\n\n");
+    }
+    else
+    {
+        putsUart0("Unknown command. Type 'help'\n");
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Hardware Initialization
+//-----------------------------------------------------------------------------
+void initHW()
+{
+    // Initialize system clock to 80 MHz
+    //initSystemClockTo80Mhz();
+
+    // Enable Port A for SPI
+    enablePort(PORTA);
+    enablePort(PORTC);
+
+    selectPinPushPullOutput(LDAC_PORT);  // Set LDAC as output
+    setPinValue(LDAC_PORT, 1);
+
+
+    // Initialize SPI0
+    initSpi0(USE_SSI0_FSS);  // Initialize SPI1
+    setSpi0BaudRate(20e6, 80e6);  // Set SPI baud rate
+    setSpi0Mode(0, 0);
+
+    putsUart0("Hardware initialized\n");
+    putsUart0("  System Clock: 80 MHz\n");
+    putsUart0("  SPI Clock: 20 MHz\n");
+}
+
+//-----------------------------------------------------------------------------
+// Main
+//-----------------------------------------------------------------------------
+int main(void)
+{
+    // Initialize clock first
+    initSystemClockTo80Mhz();
+
+    // Initialize UART
+    initUart0();
+    setUart0BaudRate(115200, 80000000);
+
+
+    // Wait a moment for UART to stabilize
+    waitMicrosecond(100000);
+
+    // Startup message
+    putsUart0("\n\n");
+    putsUart0("  \rMCP4822 DAC Direct Test\n");
+
+    // Initialize hardware
+    initHW();
+
+    putsUart0("\nType 'help' for commands\n");
+    putsUart0("Type 'test' to run automatic sequence\n");
+    putsUart0("Type 'spi' to test SPI communication\n\n");
+
+    putsUart0("\nReady!\n\n");
+
+    // Main loop
+    while (true)
+    {
+        if (kbhitUart0())
+        {
+            handleCommand();
+        }
+    }
+}
