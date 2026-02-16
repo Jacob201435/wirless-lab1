@@ -1,0 +1,457 @@
+/**
+ * main.c
+ */
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+#include <stdbool.h>
+#include "tm4c123gh6pm.h"
+#include "clock.h"
+#include "gpio.h"
+#include "nvic.h"
+#include "spi1.h"
+#include "wait.h"
+#include "uart0.h"
+#include "string.h"
+#include "clock80.h"
+
+// LDAC Bitband Alias
+#define LDAC (*((volatile uint32_t *)(0x42000000 + (0x400063FC-0x40000000)*32 + 4*4)))
+
+// DAC Control Constants
+#define DAC_A 0x3000  // DAC A
+#define DAC_B 0xB000  // DAC B
+
+// Constants
+#define FCYC 80e6
+#define FDAC 20e6
+#define LUT_SIZE 256
+#define PI 3.14159265358979323846
+#define DEFAULT_FS 100000
+
+// Gains and Offsets
+#define GAIN_I 4090 //1988
+#define GAIN_Q 1973
+#define OFS_I 2107
+#define OFS_Q 2122
+
+USER_DATA data;
+
+
+// Modulation Type Enum
+typedef enum _mode{
+    RAW, DC, SINE, BPSK, QPSK, PSK8, QAM16
+} mode;
+
+//Bits per symbol
+uint8_t bitsPerSymbol[] = {1, 1, 1, 1, 2, 3, 4};
+
+uint16_t sine_LUT[LUT_SIZE];
+uint16_t cosine_LUT[LUT_SIZE];
+uint16_t index = 0;
+
+// Lookup Tables for Different Modulations
+//BPSK
+int32_t bpskI[2] = {GAIN_I, -GAIN_I};
+int32_t bpskQ[2] = {0, 0};
+
+//QPSK
+int32_t qpskI[4] = { GAIN_I, -GAIN_I, -GAIN_I, GAIN_I };
+int32_t qpskQ[4] = { GAIN_Q, GAIN_Q, -GAIN_Q, -GAIN_Q };
+
+//8PSK
+int32_t psk8I[8] = { GAIN_I, GAIN_I * 0.707, 0, -GAIN_I * 0.707,
+                     -GAIN_I, -GAIN_I * 0.707, 0, GAIN_I * 0.707 };
+int32_t psk8Q[8] = { 0, GAIN_Q * 0.707, GAIN_Q, GAIN_Q * 0.707,
+                     0, -GAIN_Q * 0.707, -GAIN_Q, -GAIN_Q * 0.707 };
+
+
+//16QAM
+int32_t qam16I[16] = { -GAIN_I, -GAIN_I, -GAIN_I, -GAIN_I,
+                        -GAIN_I / 3, -GAIN_I / 3, -GAIN_I / 3, -GAIN_I / 3,
+                         GAIN_I / 3,  GAIN_I / 3,  GAIN_I / 3,  GAIN_I / 3,
+                         GAIN_I,  GAIN_I,  GAIN_I,  GAIN_I };
+
+int32_t qam16Q[16] = { -GAIN_Q, -GAIN_Q / 3,  GAIN_Q / 3,  GAIN_Q,
+                       -GAIN_Q, -GAIN_Q / 3,  GAIN_Q / 3,  GAIN_Q,
+                       -GAIN_Q, -GAIN_Q / 3,  GAIN_Q / 3,  GAIN_Q,
+                       -GAIN_Q, -GAIN_Q / 3,  GAIN_Q / 3,  GAIN_Q };
+
+#define H_GAIN 65536  // Scaling factor for fixed-point arithmetic (Q16 format)
+
+const int16_t rrcFilter[29] = {
+    (int16_t)(0.0106 * H_GAIN),
+    (int16_t)(0.0030 * H_GAIN),
+    (int16_t)(0.0327 * H_GAIN),
+    (int16_t)(0.0471 * H_GAIN),
+    (int16_t)(0.0265 * H_GAIN),
+    (int16_t)(-0.0275 * H_GAIN),
+    (int16_t)(-0.0852 * H_GAIN),
+    (int16_t)(-0.0994 * H_GAIN),
+    (int16_t)(-0.0321 * H_GAIN),
+    (int16_t)(0.1190 * H_GAIN),
+    (int16_t)(0.3110 * H_GAIN),
+    (int16_t)(0.4717 * H_GAIN),
+    (int32_t)(0.5343 * H_GAIN),  // Center tap
+    (int16_t)(0.4717 * H_GAIN),
+    (int16_t)(0.3110 * H_GAIN),
+    (int16_t)(0.1190 * H_GAIN),
+    (int16_t)(-0.0321 * H_GAIN),
+    (int16_t)(-0.0994 * H_GAIN),
+    (int16_t)(-0.0852 * H_GAIN),
+    (int16_t)(-0.0275 * H_GAIN),
+    (int16_t)(0.0265 * H_GAIN),
+    (int16_t)(0.0471 * H_GAIN),
+    (int16_t)(0.0327 * H_GAIN),
+    (int16_t)(0.0030 * H_GAIN),
+    (int16_t)(-0.0188 * H_GAIN),
+    (int16_t)(-0.0214 * H_GAIN),
+    (int16_t)(-0.0092 * H_GAIN),
+    (int16_t)(0.0050 * H_GAIN),
+    (int16_t)(0.0106 * H_GAIN)
+};
+
+uint16_t modIndex = 0;
+mode currentMod = BPSK;
+
+uint8_t dataStream[1024];
+uint8_t dataSize = 0;
+char datastring[80];
+bool dataUpdated = false;       // Flag to track if new data is received
+bool modulationChanged = false; // Flag to track if modulation type is changed
+
+bool rrc_filter = false;
+
+static uint8_t upsampledData[4096] = {0};  // Zero-padded upsampled data
+static uint8_t filteredStream[4096] = {0};  // Temporary storage for convolution output
+
+
+void zeroPadDataStream(uint8_t *upsampledData, uint8_t *originalData, uint8_t originalSize)
+{
+    memset(upsampledData, 0, originalSize * 4 * sizeof(uint8_t)); // Initialize to 0
+    int i;
+    for(i = 0; i < originalSize; i++)
+    {
+        upsampledData[i * 4] = originalData[i];  // Insert data, leave 3 zeros between
+    }
+}
+void applyRRCFilter()
+{
+    int upsampledSize = dataSize * 4;    // Insert 3 zeros between each symbol
+
+    // Zero-pad the data
+    zeroPadDataStream(upsampledData, dataStream, dataSize);
+    int i;
+    // Convolve with 29-tap RRC filter
+    for(i = 0; i < upsampledSize; i++)
+    {
+        int j;
+        for (j = 0; j < 29; j++)  // 29-tap filter
+        {
+            if (i >= j)
+            {
+                filteredStream[i] += (upsampledData[i - j] * rrcFilter[j]) / H_GAIN;
+            }
+        }
+    }
+
+    // Normalize the filtered output for DAC range
+    for (i = 0; i < upsampledSize; i++)
+    {
+        dataStream[i] = (uint8_t)((filteredStream[i] >> 8) & 0xFF); // Scale back to 8-bit range
+    }
+
+    dataSize = upsampledSize; // Update data size after zero-padding
+}
+
+
+void processDataString()
+{
+    memset(dataStream, 0, sizeof(dataStream)); // Clear the dataStream array
+    dataSize = 0; // Reset dataSize
+    uint8_t bitsPerSym = bitsPerSymbol[currentMod];
+    uint8_t maxVal = (1 << bitsPerSym) - 1; // Maximum value for the modulation type
+    uint8_t bitBuffer = 0;
+    uint8_t bitCount = 0;
+    int i;
+
+    for (i = 0; i < strlen(datastring) && dataSize < sizeof(dataStream); i++)
+    {
+        char c = datastring[i];
+
+        int j;
+        for (j = 7; j >= 0; j--) // Process each bit in the character
+        {
+            bitBuffer = (bitBuffer << 1) | ((c >> j) & 1);
+            bitCount++;
+
+            if (bitCount == bitsPerSym)
+            {
+                if (dataSize < sizeof(dataStream))
+                {
+                    dataStream[dataSize++] = bitBuffer & maxVal;
+                }
+                bitBuffer = 0;
+                bitCount = 0;
+            }
+        }
+    }
+
+    // If there's any remaining data, pad it and store it
+    if (bitCount > 0 && dataSize < sizeof(dataStream))
+    {
+        dataStream[dataSize++] = bitBuffer & maxVal;
+    }
+
+    // Apply RRC Filtering if enabled
+    if (rrc_filter)
+    {
+        applyRRCFilter();
+    }
+}
+void generateLUT()
+{
+    int i;
+    for (i = 0; i < LUT_SIZE; i++)
+    {
+        float angle = (2.0 * PI * i) / LUT_SIZE;  // Map index to angle
+        float sin_value = sin(angle);  // Generate sine wave value (-1 to +1)
+        float cos_value = cos(angle);  // Generate cosine wave value (-1 to +1)
+
+        // Apply gain and offset calibration
+        sine_LUT[i] = (uint16_t)(GAIN_I * sin_value);  // I-channel (sine wave)
+        cosine_LUT[i] = (uint16_t)(GAIN_Q * cos_value);  // Q-channel (cosine wave)
+    }
+}
+
+void timer1Isr() {
+
+    // Toggle LDAC to latch data
+    LDAC = 0;
+    LDAC = 1;
+
+    static uint16_t modIndex = 0;
+    uint8_t value;
+
+
+    value = dataStream[modIndex];
+    modIndex = (modIndex + 1) % dataSize; // Circular wraparound
+
+    int32_t i_value = 0;
+    int32_t q_value = 0;
+
+    // Directly map value to I/Q based on the modulation type
+    switch (currentMod){
+        case BPSK:
+            i_value = bpskI[value];
+            q_value = bpskQ[value];
+            break;
+        case QPSK:
+            i_value = qpskI[value];
+            q_value = qpskQ[value];
+            break;
+        case PSK8:
+            i_value = psk8I[value];
+            q_value = psk8Q[value];
+            break;
+        case QAM16:
+            i_value = qam16I[value];
+            q_value = qam16Q[value];
+            break;
+        case RAW:
+            i_value = getFieldInteger(&data, 1);
+            q_value = getFieldInteger(&data, 2);
+            break;
+        case DC:
+            i_value = (int)(getFieldFloat(&data, 1) * -3916);
+            q_value = (int)(getFieldFloat(&data, 2) * -3917);
+            break;
+        case SINE:
+            i_value = sine_LUT[index];
+            q_value = cosine_LUT[index];
+            index = (index + 1) % LUT_SIZE;
+            break;
+        default:
+            i_value = 0;
+            q_value = 0;
+            break;
+    }
+
+    uint16_t command = DAC_A | (i_value + OFS_I);  // Form command with control bits
+    SSI1_DR_R = command;
+    while (SSI1_SR_R & SSI_SR_BSY);
+    command = DAC_B | (q_value + OFS_Q);  // Form command with control bits
+    SSI1_DR_R = command;
+
+    // Clear interrupt flag
+    TIMER1_ICR_R = TIMER_ICR_TATOCINT;
+}
+
+
+void handleCommand()
+{
+    getsUart0(&data);
+    parseFields(&data);
+
+    if (isCommand(&data, "start", 0))
+    {
+        TIMER1_CTL_R |= TIMER_CTL_TAEN;  // Turn on timer
+        putsUart0("Transmission started.\n");
+    }
+    else if (isCommand(&data, "stop", 0))
+    {
+        TIMER1_CTL_R &= ~TIMER_CTL_TAEN;  // Turn off timer
+        putsUart0("Transmission stopped.\n");
+    }
+    else if (isCommand(&data, "sine", 0))
+    {
+        currentMod = SINE;
+        putsUart0("Switched to SINE wave mode.\n");
+    }
+    else if (isCommand(&data, "data", 1))
+    {
+        strncpy(datastring, getFieldString(&data, 1), 80);
+        datastring[79] = '\0';  // Ensure null termination
+        dataUpdated = true;  // Mark that new data is available
+        putsUart0("Data string updated.\n");
+    }
+    else if (isCommand(&data, "mod", 1))
+    {
+        char *str = getFieldString(&data, 1);
+
+        if (strcmp(str, "bpsk") == 0)
+        {
+            TIMER1_CTL_R &= ~TIMER_CTL_TAEN;
+            currentMod = BPSK;
+        }
+        else if (strcmp(str, "qpsk") == 0)
+        {
+            TIMER1_CTL_R &= ~TIMER_CTL_TAEN;
+            currentMod = QPSK;
+        }
+
+        else if (strcmp(str, "psk") == 0)
+        {
+            TIMER1_CTL_R &= ~TIMER_CTL_TAEN;
+            currentMod = PSK8;
+        }
+        else if (strcmp(str, "qam") == 0)
+        {
+            TIMER1_CTL_R &= ~TIMER_CTL_TAEN;
+            currentMod = QAM16;
+        }
+        else
+        {
+            putsUart0("Error! Supported modulation types: bpsk, qpsk, 8psk, 16qam\n");
+            return;
+        }
+
+        putsUart0("Modulation changed successfully.\n");
+        modulationChanged = true; // Mark that modulation has changed
+    }
+    else if (isCommand(&data, "raw", 2))
+    {
+        currentMod = RAW;
+        putsUart0("Switched to RAW mode.\n");
+    }
+    else if (isCommand(&data, "dc", 2))
+    {
+        currentMod = DC;
+        putsUart0("Switched to DC mode.\n");
+    }
+    else if(isCommand(&data, "freq", 1))
+    {
+        TIMER1_TAILR_R = 80e6 / getFieldInteger(&data, 1);
+    }
+    else if (isCommand(&data, "rrc", 1))
+    {
+        char *str = getFieldString(&data, 1);
+        if(strcmp(str, "on") == 0)
+        {
+            rrc_filter = true;
+            putsUart0("RRC Filter ON. Data will be filtered before transmission.\n");
+            processDataString(); // Reprocess data with filtering
+        }
+        else if(strcmp(str, "off") == 0)
+        {
+            rrc_filter = false;
+            putsUart0("RRC Filter OFF. Data will be transmitted as is.\n");
+            processDataString(); // Reprocess data without filtering
+        }
+        else
+        {
+            putsUart0("Error! Type 'rrc on' or 'rrc off'.\n");
+        }
+    }
+
+    else if (isCommand(&data, "help", 0))
+    {
+        putsUart0("Available commands:\n");
+        putsUart0("  start        - Start transmission\n");
+        putsUart0("  stop         - Stop transmission\n");
+        putsUart0("  sine         - Switch to SINE wave mode\n");
+        putsUart0("  data <str>   - Set data string\n");
+        putsUart0("  mod <type>   - Change modulation (bpsk, qpsk, 8psk, 16qam)\n");
+        putsUart0("  raw <I Q>    - Set raw I/Q values\n");
+        putsUart0("  dc <I Q>     - Set DC offset values\n");
+        putsUart0("  rrc <on/off> - Turn RRC filter on or off\n");
+    }
+    else
+    {
+        putsUart0("Invalid command. Type 'help' for command options.\n");
+    }
+}
+void initHW()
+{
+    // Initialize system clock
+    initSystemClockTo80Mhz();
+
+    //Enable Ports
+    SYSCTL_RCGCTIMER_R |= SYSCTL_RCGCTIMER_R1;
+    enablePort(PORTC);
+    enablePort(PORTD);
+
+
+    //Enable Timer
+    TIMER1_CTL_R &= ~TIMER_CTL_TAEN;                 // turn-off timer before reconfiguring
+    TIMER1_CFG_R = TIMER_CFG_32_BIT_TIMER;           // configure as 32-bit timer (A+B)
+    TIMER1_TAMR_R = TIMER_TAMR_TAMR_PERIOD;          // configure for periodic mode (count down)
+    TIMER1_TAILR_R = 4000;                           // 100000Hz
+    TIMER1_IMR_R = TIMER_IMR_TATOIM;                 // turn-on interrupts
+    NVIC_EN0_R = 1 << (INT_TIMER1A-16);              // turn-on interrupt 37 (TIMER1A)
+
+
+    selectPinPushPullOutput(PORTC, 4);  // Set LDAC as output
+    initSpi1(USE_SSI_FSS);  // Initialize SPI1
+    setSpi1BaudRate(FDAC, 80e6);  // Set SPI baud rate
+}
+int main(void)
+{
+    // Initialize hardware
+    initHW();
+    initUart0();
+    setUart0BaudRate(115200, 80e6);
+    generateLUT();
+
+
+    putsUart0("CSE-4377 Wireless Communication Systems:\n");
+    putsUart0("Type 'help' for available commands.\n");
+
+    while (true)
+    {
+        if (kbhitUart0())
+        {
+            handleCommand();
+
+            // Process data when either the data string OR modulation type changes
+            if (dataUpdated || modulationChanged)
+            {
+                processDataString();
+                dataUpdated = false;
+                modulationChanged = false;
+                putsUart0("Data processed successfully.\n");
+            }
+        }
+    }
+}
