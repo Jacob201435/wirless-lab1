@@ -1,0 +1,269 @@
+/**
+ * main.c - Simplified DAC Calibration Version
+ * For calculating offset and gain values
+ */
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "tm4c123gh6pm.h"
+#include "clock.h"
+#include "gpio.h"
+#include "nvic.h"
+#include "spi1.h"
+#include "wait.h"
+#include "uart0.h"
+#include "string.h"
+
+// LDAC Bitband Alias
+#define LDAC (*((volatile uint32_t *)(0x42000000 + (0x400063FC-0x40000000)*32 + 4*4)))
+
+// DAC Control Constants
+#define DAC_A 0x3000  // DAC A (I channel)
+#define DAC_B 0xB000  // DAC B (Q channel)
+
+// Constants
+#define FCYC 80e6
+#define FDAC 20e6
+
+// Global variables for DAC values
+int32_t i_value = 2048;  // Start at mid-scale (0V)
+int32_t q_value = 2048;  // Start at mid-scale (0V)
+
+USER_DATA data;
+
+//-----------------------------------------------------------------------------
+// Timer ISR - Outputs I and Q values to DAC
+//-----------------------------------------------------------------------------
+void timer1Isr() 
+{
+    // Toggle LDAC to latch data
+    LDAC = 0;
+    LDAC = 1;
+
+    // Send I value to DAC A
+    uint16_t command = DAC_A | (i_value & 0x0FFF);  // Mask to 12 bits
+    SSI1_DR_R = command;
+    while (SSI1_SR_R & SSI_SR_BSY);
+    
+    // Send Q value to DAC B
+    command = DAC_B | (q_value & 0x0FFF);  // Mask to 12 bits
+    SSI1_DR_R = command;
+
+    // Clear interrupt flag
+    TIMER1_ICR_R = TIMER_ICR_TATOCINT;
+}
+
+//-----------------------------------------------------------------------------
+// Command Handler - Simple commands for setting I and Q
+//-----------------------------------------------------------------------------
+void handleCommand()
+{
+    getsUart0(&data);
+    parseFields(&data);
+
+    if (isCommand(&data, "set", 2))
+    {
+        // Command: set <I_value> <Q_value>
+        // Values: 0-4095 (12-bit DAC range)
+        i_value = getFieldInteger(&data, 1);
+        q_value = getFieldInteger(&data, 2);
+        
+        // Clamp to 12-bit range
+        if (i_value < 0) i_value = 0;
+        if (i_value > 4095) i_value = 4095;
+        if (q_value < 0) q_value = 0;
+        if (q_value > 4095) q_value = 4095;
+        
+        putsUart0("DAC values set: I=");
+        char buffer[20];
+        // Simple integer to string conversion
+        int i = i_value, pos = 0;
+        if (i == 0) buffer[pos++] = '0';
+        else {
+            char temp[20];
+            int j = 0;
+            while (i > 0) {
+                temp[j++] = '0' + (i % 10);
+                i /= 10;
+            }
+            while (j > 0) buffer[pos++] = temp[--j];
+        }
+        buffer[pos] = '\0';
+        putsUart0(buffer);
+        
+        putsUart0(", Q=");
+        i = q_value; pos = 0;
+        if (i == 0) buffer[pos++] = '0';
+        else {
+            char temp[20];
+            int j = 0;
+            while (i > 0) {
+                temp[j++] = '0' + (i % 10);
+                i /= 10;
+            }
+            while (j > 0) buffer[pos++] = temp[--j];
+        }
+        buffer[pos] = '\0';
+        putsUart0(buffer);
+        putsUart0("\n");
+    }
+    else if (isCommand(&data, "mid", 0))
+    {
+        // Command: mid - Set to mid-scale (should give 0V)
+        i_value = 2048;
+        q_value = 2048;
+        putsUart0("Set to mid-scale: I=2048, Q=2048\n");
+    }
+    else if (isCommand(&data, "min", 0))
+    {
+        // Command: min - Set to minimum (should give -0.5V)
+        i_value = 0;
+        q_value = 0;
+        putsUart0("Set to minimum: I=0, Q=0\n");
+    }
+    else if (isCommand(&data, "max", 0))
+    {
+        // Command: max - Set to maximum (should give +0.5V)
+        i_value = 4095;
+        q_value = 4095;
+        putsUart0("Set to maximum: I=4095, Q=4095\n");
+    }
+    else if (isCommand(&data, "i", 1))
+    {
+        // Command: i <value> - Set I channel only
+        i_value = getFieldInteger(&data, 1);
+        if (i_value < 0) i_value = 0;
+        if (i_value > 4095) i_value = 4095;
+        
+        putsUart0("I channel set to: ");
+        char buffer[20];
+        int i = i_value, pos = 0;
+        if (i == 0) buffer[pos++] = '0';
+        else {
+            char temp[20];
+            int j = 0;
+            while (i > 0) {
+                temp[j++] = '0' + (i % 10);
+                i /= 10;
+            }
+            while (j > 0) buffer[pos++] = temp[--j];
+        }
+        buffer[pos] = '\0';
+        putsUart0(buffer);
+        putsUart0("\n");
+    }
+    else if (isCommand(&data, "q", 1))
+    {
+        // Command: q <value> - Set Q channel only
+        q_value = getFieldInteger(&data, 1);
+        if (q_value < 0) q_value = 0;
+        if (q_value > 4095) q_value = 4095;
+        
+        putsUart0("Q channel set to: ");
+        char buffer[20];
+        int i = q_value, pos = 0;
+        if (i == 0) buffer[pos++] = '0';
+        else {
+            char temp[20];
+            int j = 0;
+            while (i > 0) {
+                temp[j++] = '0' + (i % 10);
+                i /= 10;
+            }
+            while (j > 0) buffer[pos++] = temp[--j];
+        }
+        buffer[pos] = '\0';
+        putsUart0(buffer);
+        putsUart0("\n");
+    }
+    else if (isCommand(&data, "start", 0))
+    {
+        // Start continuous output
+        TIMER1_CTL_R |= TIMER_CTL_TAEN;
+        putsUart0("DAC output started\n");
+    }
+    else if (isCommand(&data, "stop", 0))
+    {
+        // Stop output
+        TIMER1_CTL_R &= ~TIMER_CTL_TAEN;
+        putsUart0("DAC output stopped\n");
+    }
+    else if (isCommand(&data, "help", 0))
+    {
+        putsUart0("\n=== DAC Calibration Commands ===\n");
+        putsUart0("set <I> <Q>  - Set both channels (0-4095)\n");
+        putsUart0("               Example: set 2048 2048\n");
+        putsUart0("i <value>    - Set I channel only (0-4095)\n");
+        putsUart0("q <value>    - Set Q channel only (0-4095)\n");
+        putsUart0("mid          - Set to mid-scale (2048, 2048)\n");
+        putsUart0("min          - Set to minimum (0, 0)\n");
+        putsUart0("max          - Set to maximum (4095, 4095)\n");
+        putsUart0("start        - Start DAC output\n");
+        putsUart0("stop         - Stop DAC output\n");
+        putsUart0("help         - Show this help\n");
+        putsUart0("\nDAC Range: 0 = 0V, 2048 = 1.024V, 4095 = 2.047V\n");
+        putsUart0("After op-amp: 0V, +0.5V scaling\n\n");
+    }
+    else
+    {
+        putsUart0("Unknown command. Type 'help' for options.\n");
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Hardware Initialization
+//-----------------------------------------------------------------------------
+void initHW()
+{
+    // Initialize system clock
+    initSystemClockTo80Mhz();
+
+    // Enable Ports
+    SYSCTL_RCGCTIMER_R |= SYSCTL_RCGCTIMER_R1;
+    enablePort(PORTC);
+    enablePort(PORTD);
+
+    // Enable Timer (10 kHz update rate for smooth output)
+    TIMER1_CTL_R &= ~TIMER_CTL_TAEN;                 // Turn off timer
+    TIMER1_CFG_R = TIMER_CFG_32_BIT_TIMER;           // 32-bit timer
+    TIMER1_TAMR_R = TIMER_TAMR_TAMR_PERIOD;          // Periodic mode
+    TIMER1_TAILR_R = 8000;                           // 10 kHz update rate
+    TIMER1_IMR_R = TIMER_IMR_TATOIM;                 // Enable interrupts
+    NVIC_EN0_R = 1 << (INT_TIMER1A-16);              // Enable interrupt 37
+
+    // Configure LDAC pin
+    selectPinPushPullOutput(PORTC, 4);
+    
+    // Initialize SPI
+    initSpi1(USE_SSI_FSS);
+    setSpi1BaudRate(FDAC, 80e6);
+}
+
+//-----------------------------------------------------------------------------
+// Main
+//-----------------------------------------------------------------------------
+int main(void)
+{
+    // Initialize hardware
+    initHW();
+    initUart0();
+    setUart0BaudRate(115200, 80e6);
+
+    // Startup message
+    putsUart0("\n\n");
+    putsUart0("========================================\n");
+    putsUart0("  MCP4822 DAC Calibration Tool\n");
+    putsUart0("  CSE-4377 Lab 1\n");
+    putsUart0("========================================\n");
+    putsUart0("\nType 'help' for available commands\n");
+    putsUart0("Type 'start' to begin DAC output\n\n");
+
+    // Main loop
+    while (true)
+    {
+        if (kbhitUart0())
+        {
+            handleCommand();
+        }
+    }
+}
