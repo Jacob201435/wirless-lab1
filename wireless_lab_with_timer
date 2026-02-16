@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <math.h>
 #include "tm4c123gh6pm.h"
 #include "clock.h"
 #include "clock80.h"
@@ -25,12 +26,49 @@
 // Constants
 #define FCYC 80e6
 #define FDAC 20e6
+#define LUT_SIZE 256
+#define PI 3.14159265358979323846
+#define DEFAULT_FS 100000
+
 
 // Global variables for DAC values
 int32_t i_value = 2048;  // Start at mid-scale (0V)
 int32_t q_value = 2048;  // Start at mid-scale (0V)
 
+// Gains and Offsets
+#define GAIN_I 1977
+#define GAIN_Q 1972
+#define OFS_I 2120
+#define OFS_Q 2078
+
 USER_DATA data;
+
+// Modulation Type Enum
+typedef enum _mode{
+    RAW, DC, SINE
+} mode;
+
+//Bits per symbol
+uint8_t bitsPerSymbol[] = {1, 1, 1, 1, 2, 3, 4};
+
+uint16_t sine_LUT[LUT_SIZE];
+uint16_t cosine_LUT[LUT_SIZE];
+uint16_t index = 0;
+
+void generateLUT()
+{
+    int i;
+    for (i = 0; i < LUT_SIZE; i++)
+    {
+        float angle = (2.0 * PI * i) / LUT_SIZE;  // Map index to angle
+        float sin_value = sin(angle);  // Generate sine wave value (-1 to +1)
+        float cos_value = cos(angle);  // Generate cosine wave value (-1 to +1)
+
+        // Apply gain and offset calibration
+        sine_LUT[i] = (uint16_t)(GAIN_I * sin_value);  // I-channel (sine wave)
+        cosine_LUT[i] = (uint16_t)(GAIN_Q * cos_value);  // Q-channel (cosine wave)
+    }
+}
 
 //-----------------------------------------------------------------------------
 // Timer ISR - Outputs I and Q values to DAC
@@ -87,12 +125,13 @@ void handleCommand()
         putsUart0(buffer);
         putsUart0("\n");
     }
-    else if (isCommand(&data, "mid", 0))
+    else if (isCommand(&data, "sine", 0))
     {
-        // Command: mid - Set to mid-scale (should give 0V)
-        i_value = 2048;
-        q_value = 2048;
-        putsUart0("\rSet to mid-scale: I=2048, Q=2048\n");
+        // Command: sine mode set
+        i_value = sine_LUT[index];
+        q_value = cosine_LUT[index];
+        index = (index + 1) % LUT_SIZE;
+        putsUart0("\rSwitched to SINE wave mode.\n");
     }
     else if (isCommand(&data, "min", 0))
     {
