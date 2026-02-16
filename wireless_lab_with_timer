@@ -1,13 +1,12 @@
 /**
- * main.c - Simplified DAC Calibration Version
- * For calculating offset and gain values
+ * main.c - DAC with Sine Wave Generation
+ * CSE-4377 Lab 1
  */
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
 #include "tm4c123gh6pm.h"
-#include "clock.h"
 #include "clock80.h"
 #include "gpio.h"
 #include "nvic.h"
@@ -28,45 +27,49 @@
 #define FDAC 20e6
 #define LUT_SIZE 256
 #define PI 3.14159265358979323846
-#define DEFAULT_FS 100000
 
-
-// Global variables for DAC values
-int32_t i_value = 2048;  // Start at mid-scale (0V)
-int32_t q_value = 2048;  // Start at mid-scale (0V)
-
-// Gains and Offsets
+// Gains and Offsets (from your calibration)
 #define GAIN_I 1977
 #define GAIN_Q 1972
 #define OFS_I 2120
 #define OFS_Q 2078
 
+// Global variables for DAC values
+int32_t i_value = 2048;  // Start at mid-scale (0V)
+int32_t q_value = 2048;  // Start at mid-scale (0V)
+
+// Mode control
+typedef enum {
+    MODE_STATIC,    // Static I/Q values
+    MODE_SINE       // Generate sine wave
+} OperationMode;
+
+OperationMode currentMode = MODE_STATIC;
+
 USER_DATA data;
 
-// Modulation Type Enum
-typedef enum _mode{
-    RAW, DC, SINE
-} mode;
+// Sine wave lookup table
+int16_t sine_LUT[LUT_SIZE];
+int16_t cosine_LUT[LUT_SIZE];
+uint16_t lut_index = 0;
 
-//Bits per symbol
-uint8_t bitsPerSymbol[] = {1, 1, 1, 1, 2, 3, 4};
-
-uint16_t sine_LUT[LUT_SIZE];
-uint16_t cosine_LUT[LUT_SIZE];
-uint16_t index = 0;
-
+//-----------------------------------------------------------------------------
+// Generate Sine/Cosine Lookup Tables
+//-----------------------------------------------------------------------------
 void generateLUT()
 {
     int i;
     for (i = 0; i < LUT_SIZE; i++)
     {
         float angle = (2.0 * PI * i) / LUT_SIZE;  // Map index to angle
-        float sin_value = sin(angle);  // Generate sine wave value (-1 to +1)
-        float cos_value = cos(angle);  // Generate cosine wave value (-1 to +1)
+        float sin_value = sinf(angle);  // Generate sine wave value (-1 to +1)
+        float cos_value = cosf(angle);  // Generate cosine wave value (-1 to +1)
 
-        // Apply gain and offset calibration
-        sine_LUT[i] = (uint16_t)(GAIN_I * sin_value);  // I-channel (sine wave)
-        cosine_LUT[i] = (uint16_t)(GAIN_Q * cos_value);  // Q-channel (cosine wave)
+        // Scale by gain to get proper amplitude
+        // sin_value and cos_value are -1 to +1
+        // Multiply by GAIN to get the deviation from center
+        sine_LUT[i] = (int16_t)(sin_value * GAIN_I);
+        cosine_LUT[i] = (int16_t)(cos_value * GAIN_Q);
     }
 }
 
@@ -75,35 +78,106 @@ void generateLUT()
 //-----------------------------------------------------------------------------
 void timer1Isr()
 {
+    uint16_t command;
+    int32_t dac_i, dac_q;
+
     // Toggle LDAC to latch data
     LDAC = 0;
     LDAC = 1;
 
+    if (currentMode == MODE_SINE)
+    {
+        // Generate sine wave
+        // I channel gets cosine (for proper phase relationship)
+        // Q channel gets sine
+        dac_i = sine_LUT[lut_index] + OFS_I;
+        dac_q = cosine_LUT[lut_index] + OFS_Q;
+
+        // Increment index for next sample
+        lut_index++;
+        if (lut_index >= LUT_SIZE)
+            lut_index = 0;
+    }
+    else
+    {
+        // Static mode - use set values
+        dac_i = i_value;
+        dac_q = q_value;
+    }
+
+    // Clamp to 12-bit range
+    if (dac_i < 0) dac_i = 0;
+    if (dac_i > 4095) dac_i = 4095;
+    if (dac_q < 0) dac_q = 0;
+    if (dac_q > 4095) dac_q = 4095;
+
     // Send I value to DAC A
-    uint16_t command = DAC_A | (i_value & 0x0FFF);  // Mask to 12 bits
+    command = DAC_A | (dac_i & 0x0FFF);
     SSI1_DR_R = command;
     while (SSI1_SR_R & SSI_SR_BSY);
 
     // Send Q value to DAC B
-    command = DAC_B | (q_value & 0x0FFF);  // Mask to 12 bits
+    command = DAC_B | (dac_q & 0x0FFF);
     SSI1_DR_R = command;
+    while (SSI1_SR_R & SSI_SR_BSY);
 
     // Clear interrupt flag
     TIMER1_ICR_R = TIMER_ICR_TATOCINT;
 }
 
 //-----------------------------------------------------------------------------
-// Command Handler - Simple commands for setting I and Q
+// Simple integer to string converter
+//-----------------------------------------------------------------------------
+void intToStr(int32_t value, char* buffer)
+{
+    int pos = 0;
+    int temp;
+    char rev[20];
+    int rpos = 0;
+
+    if (value == 0)
+    {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+
+    if (value < 0)
+    {
+        buffer[pos++] = '-';
+        value = -value;
+    }
+
+    temp = value;
+    while (temp > 0)
+    {
+        rev[rpos++] = '0' + (temp % 10);
+        temp /= 10;
+    }
+
+    while (rpos > 0)
+    {
+        buffer[pos++] = rev[--rpos];
+    }
+
+    buffer[pos] = '\0';
+}
+
+//-----------------------------------------------------------------------------
+// Command Handler
 //-----------------------------------------------------------------------------
 void handleCommand()
 {
+    char buffer[20];
+
     getsUart0(&data);
     parseFields(&data);
 
     if (isCommand(&data, "set", 2))
     {
         // Command: set <I_value> <Q_value>
-        // Values: 0-4095 (12-bit DAC range)
+        currentMode = MODE_STATIC;
+
         i_value = getFieldInteger(&data, 1);
         q_value = getFieldInteger(&data, 2);
 
@@ -113,65 +187,75 @@ void handleCommand()
         if (q_value < 0) q_value = 0;
         if (q_value > 4095) q_value = 4095;
 
-        putsUart0("\rDAC values set: I=");
-        char* buffer;
-        buffer = itoa (q_value);
-
+        putsUart0("DAC values set: I=");
+        intToStr(i_value, buffer);
         putsUart0(buffer);
-
         putsUart0(", Q=");
-        buffer = itoa (q_value);
-
+        intToStr(q_value, buffer);
         putsUart0(buffer);
         putsUart0("\n");
     }
     else if (isCommand(&data, "sine", 0))
     {
-        // Command: sine mode set
-        i_value = sine_LUT[index];
-        q_value = cosine_LUT[index];
-        index = (index + 1) % LUT_SIZE;
-        putsUart0("\rSwitched to SINE wave mode.\n");
+        // Command: sine - Generate 10 kHz sine wave
+        currentMode = MODE_SINE;
+        lut_index = 0;
+        putsUart0("Switched to SINE wave mode (10 kHz)\n");
+        putsUart0("I = cosine, Q = sine\n");
+    }
+    else if (isCommand(&data, "static", 0))
+    {
+        // Command: static - Return to static mode
+        currentMode = MODE_STATIC;
+        putsUart0("Switched to STATIC mode\n");
+    }
+    else if (isCommand(&data, "mid", 0))
+    {
+        // Command: mid - Set to mid-scale
+        currentMode = MODE_STATIC;
+        i_value = OFS_I;
+        q_value = OFS_Q;
+        putsUart0("Set to mid-scale (offset values)\n");
     }
     else if (isCommand(&data, "min", 0))
     {
-        // Command: min - Set to minimum (should give -0.5V)
+        // Command: min - Set to minimum
+        currentMode = MODE_STATIC;
         i_value = 0;
         q_value = 0;
-        putsUart0("\rSet to minimum: I=0, Q=0\n");
+        putsUart0("Set to minimum: I=0, Q=0\n");
     }
     else if (isCommand(&data, "max", 0))
     {
-        // Command: max - Set to maximum (should give +0.5V)
+        // Command: max - Set to maximum
+        currentMode = MODE_STATIC;
         i_value = 4095;
         q_value = 4095;
-        putsUart0("\rSet to maximum: I=4095, Q=4095\n");
+        putsUart0("Set to maximum: I=4095, Q=4095\n");
     }
     else if (isCommand(&data, "i", 1))
     {
         // Command: i <value> - Set I channel only
+        currentMode = MODE_STATIC;
         i_value = getFieldInteger(&data, 1);
         if (i_value < 0) i_value = 0;
         if (i_value > 4095) i_value = 4095;
 
-        putsUart0("\rI channel set to: ");
-        char* buffer;
-        buffer = itoa (q_value);
-
+        putsUart0("I channel set to: ");
+        intToStr(i_value, buffer);
         putsUart0(buffer);
         putsUart0("\n");
     }
     else if (isCommand(&data, "q", 1))
     {
         // Command: q <value> - Set Q channel only
+        currentMode = MODE_STATIC;
         q_value = getFieldInteger(&data, 1);
         if (q_value < 0) q_value = 0;
         if (q_value > 4095) q_value = 4095;
 
-        putsUart0("\rQ channel set to: ");
-        char* buffer;
-        buffer = itoa (q_value);
-
+        putsUart0("Q channel set to: ");
+        intToStr(q_value, buffer);
         putsUart0(buffer);
         putsUart0("\n");
     }
@@ -179,30 +263,76 @@ void handleCommand()
     {
         // Start continuous output
         TIMER1_CTL_R |= TIMER_CTL_TAEN;
-        putsUart0("\rDAC output started\n");
+        putsUart0("DAC output started\n");
     }
     else if (isCommand(&data, "stop", 0))
     {
         // Stop output
         TIMER1_CTL_R &= ~TIMER_CTL_TAEN;
-        putsUart0("\rDAC output stopped\n");
+        putsUart0("DAC output stopped\n");
+    }
+    else if (isCommand(&data, "freq", 1))
+    {
+        // Command: freq <Hz> - Set output frequency
+        uint32_t freq = getFieldInteger(&data, 1);
+
+        // Calculate samples per cycle
+        // Timer runs at 10 kHz (configured in initHW)
+        // For 10 kHz output, we need all 256 samples in one cycle
+        // Timer freq = 10000 Hz, want output freq = 10000 Hz
+        // So we output 256 samples at 2.56 MHz sample rate
+
+        // Actually, for 10 kHz sine with 256-point LUT:
+        // Sample rate needed = 10000 * 256 = 2.56 MHz
+        // Timer period = 80MHz / 2.56MHz = 31.25
+
+        if (freq < 1 || freq > 100000)
+        {
+            putsUart0("Frequency must be 1-100000 Hz\n");
+            return;
+        }
+
+        uint32_t timer_load = 80000000 / (freq * 256);
+        TIMER1_TAILR_R = timer_load;
+
+        putsUart0("Frequency set to: ");
+        intToStr(freq, buffer);
+        putsUart0(buffer);
+        putsUart0(" Hz\n");
     }
     else if (isCommand(&data, "help", 0))
     {
-        putsUart0("\rset <I> <Q>  - Set both channels (0-4095)\n");
-        putsUart0("\r               Example: set 2048 2048\n");
-        putsUart0("\ri <value>    - Set I channel only (0-4095)\n");
-        putsUart0("\rq <value>    - Set Q channel only (0-4095)\n");
-        putsUart0("\rmid          - Set to mid-scale (2048, 2048)\n");
-        putsUart0("\rmin          - Set to minimum (0, 0)\n");
-        putsUart0("\rmax          - Set to maximum (4095, 4095)\n");
-        putsUart0("\rstart        - Start DAC output\n");
-        putsUart0("\rstop         - Stop DAC output\n");
-        putsUart0("\rhelp         - Show this help\n");
+        putsUart0("\n=== CSE-4377 Lab 1 Commands ===\n");
+        putsUart0("set <I> <Q>  - Set both channels (0-4095)\n");
+        putsUart0("i <value>    - Set I channel only (0-4095)\n");
+        putsUart0("q <value>    - Set Q channel only (0-4095)\n");
+        putsUart0("mid          - Set to calibrated mid-scale\n");
+        putsUart0("min          - Set to minimum (0, 0)\n");
+        putsUart0("max          - Set to maximum (4095, 4095)\n");
+        putsUart0("sine         - Generate 10 kHz sine wave\n");
+        putsUart0("static       - Return to static mode\n");
+        putsUart0("freq <Hz>    - Set sine frequency (1-100000 Hz)\n");
+        putsUart0("start        - Start DAC output\n");
+        putsUart0("stop         - Stop DAC output\n");
+        putsUart0("help         - Show this help\n\n");
+        putsUart0("Calibration values:\n");
+        putsUart0("  GAIN_I=");
+        intToStr(GAIN_I, buffer);
+        putsUart0(buffer);
+        putsUart0(", GAIN_Q=");
+        intToStr(GAIN_Q, buffer);
+        putsUart0(buffer);
+        putsUart0("\n  OFS_I=");
+        intToStr(OFS_I, buffer);
+        putsUart0(buffer);
+        putsUart0(", OFS_Q=");
+        intToStr(OFS_Q, buffer);
+        putsUart0(buffer);
+        putsUart0("\n\n");
     }
     else
     {
-        putsUart0("\rUnknown command. Type 'help' for options.\n");
+        putsUart0("Unknown command. Type 'help' for options.\n");
     }
 }
 
@@ -211,7 +341,7 @@ void handleCommand()
 //-----------------------------------------------------------------------------
 void initHW()
 {
-    // Initialize system clock
+    // Initialize system clock to 80 MHz
     initSystemClockTo80Mhz();
 
     // Enable Ports
@@ -219,11 +349,13 @@ void initHW()
     enablePort(PORTC);
     enablePort(PORTD);
 
-    // Enable Timer (10 kHz update rate for smooth output)
+    // Enable Timer
+    // For 10 kHz sine wave with 256-point LUT, we need 2.56 MHz sample rate
+    // Timer period = 80MHz / 2.56MHz = 31.25 = 31
     TIMER1_CTL_R &= ~TIMER_CTL_TAEN;                 // Turn off timer
     TIMER1_CFG_R = TIMER_CFG_32_BIT_TIMER;           // 32-bit timer
     TIMER1_TAMR_R = TIMER_TAMR_TAMR_PERIOD;          // Periodic mode
-    TIMER1_TAILR_R = 8000;                           // 10 kHz update rate
+    TIMER1_TAILR_R = 31;                             // 2.58 MHz sample rate (for 10.08 kHz output)
     TIMER1_IMR_R = TIMER_IMR_TATOIM;                 // Enable interrupts
     NVIC_EN0_R = 1 << (INT_TIMER1A-16);              // Enable interrupt 37
 
@@ -245,11 +377,17 @@ int main(void)
     initUart0();
     setUart0BaudRate(115200, 80e6);
 
+    // Generate lookup tables
+    generateLUT();
+
     // Startup message
     putsUart0("\n\n");
-    putsUart0("\r  CSE-4377 Lab 1\n");
-    putsUart0("\r\nType 'help' for available commands\n");
-    putsUart0("\rType 'start' to begin DAC output\n\n");
+    putsUart0("========================================\n");
+    putsUart0("  CSE-4377 Lab 1 - IQ Modulation\n");
+    putsUart0("========================================\n");
+    putsUart0("\nType 'help' for available commands\n");
+    putsUart0("Type 'start' to begin DAC output\n");
+    putsUart0("Type 'sine' for 10 kHz test tone\n\n");
 
     // Main loop
     while (true)
