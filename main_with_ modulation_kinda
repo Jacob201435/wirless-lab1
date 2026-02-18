@@ -1,5 +1,5 @@
 /**
- * main.c - DAC with Sine Wave Generation and Digital Modulation
+ * main.c - Complete IQ Modulation with Sine and Digital Modulation
  * CSE-4377 Lab 1
  */
 #include <stdlib.h>
@@ -34,117 +34,120 @@
 #define OFS_I 2120
 #define OFS_Q 2078
 
-USER_DATA data; // Global variable for UART command parsing
+// Global variables for DAC values
+int32_t i_value = 2048;  // Start at mid-scale (0V)
+int32_t q_value = 2048;  // Start at mid-scale (0V)
 
 // Mode control
-typedef enum
-{
-    MODE_STATIC,
-    MODE_SINE,
-    MODE_STREAM
+typedef enum {
+    MODE_STATIC,    // Static I/Q values
+    MODE_SINE,      // Generate sine wave
+    MODE_STREAM     // Stream digital modulation
 } OperationMode;
 
-OperationMode currentMode = MODE_STATIC;    // Start in static mode
+OperationMode currentMode = MODE_STATIC;
 
-// Sine wave lookup table
-int16_t sine_LUT[LUT_SIZE];
-int16_t cosine_LUT[LUT_SIZE];
-uint16_t lut_index = 0;
-
-int32_t i_value = OFS_I;  // Default to mid-scale
-int32_t q_value = OFS_Q;  // Default to mid-scale
-
-typedef enum
-{
+// Modulation types
+typedef enum {
     MOD_BPSK  = 1,
     MOD_QPSK  = 2,
     MOD_8PSK  = 3,
     MOD_16QAM = 4
 } ModType;
 
-volatile ModType modType = MOD_QPSK;
+ModType modType = MOD_QPSK;  // Default to QPSK
 
-#define STREAM_MAX 1024                     // Max symbols in stream
-volatile uint8_t symbolStream[STREAM_MAX];  // Symbol stream
-volatile uint32_t symbolCount = 0;          // Number of symbols currently in stream
-volatile uint32_t symbolIndex = 0;          // Index of next symbol to output
+// Phase accumulator for precise frequency control (SINE mode)
+uint32_t phase_accumulator = 0;
+uint32_t phase_increment = 0;
 
-// Rates
-volatile uint32_t sampleRateHz = 2560000;   // Computed from timer
-volatile uint32_t symbolRate   = 1000;      // Symbols/sec
-volatile uint32_t samplesPerSymbol = 2560;  // sampleRateHz / symbolRate
-volatile uint32_t spsCount = 0;
+USER_DATA data;
 
-// Current baseband symbol (signed)
-volatile int32_t stream_i = 0;
-volatile int32_t stream_q = 0;
+// Sine wave lookup table
+int16_t sine_LUT[LUT_SIZE];
+int16_t cosine_LUT[LUT_SIZE];
 
-// BPSK
+// Symbol stream data
+#define STREAM_MAX 1024
+uint8_t symbolStream[STREAM_MAX];
+uint32_t symbolCount = 0;
+uint32_t symbolIndex = 0;
+
+// Symbol rate control
+uint32_t symbolRate = 1000;              // Symbols per second
+uint32_t sampleRate = 250000;            // Fixed sample rate (250 kHz)
+uint32_t samplesPerSymbol = 250;         // Samples to hold each symbol
+uint32_t sampleCounter = 0;              // Counter for current symbol
+
+// Current symbol values
+int16_t current_i = 0;
+int16_t current_q = 0;
+
+//-----------------------------------------------------------------------------
+// Constellation Lookup Tables
+//-----------------------------------------------------------------------------
+
+// BPSK: 2 points
 static const int16_t bpskI[2] = { +GAIN_I, -GAIN_I };
 static const int16_t bpskQ[2] = { 0, 0 };
 
-// QPSK (Gray-coded: 00,01,11,10)
+// QPSK: 4 points (Gray-coded)
 static const int16_t qpskI[4] = { +GAIN_I, -GAIN_I, -GAIN_I, +GAIN_I };
 static const int16_t qpskQ[4] = { +GAIN_Q, +GAIN_Q, -GAIN_Q, -GAIN_Q };
 
-// 8PSK (0,45,90,135,180,225,270,315 degrees)
-static const int16_t psk8I[8] =
-{
-    (int16_t)(+1.000f * GAIN_I),    // 0 degrees
-    (int16_t)(+0.707f * GAIN_I),    // 45 degrees
-    (int16_t)(+0.000f * GAIN_I),    // 90 degrees
-    (int16_t)(-0.707f * GAIN_I),    // 135 degrees
-    (int16_t)(-1.000f * GAIN_I),    // 180 degrees
-    (int16_t)(-0.707f * GAIN_I),    // 225 degrees
-    (int16_t)(+0.000f * GAIN_I),    // 270 degrees
-    (int16_t)(+0.707f * GAIN_I)     // 315 degrees
+// 8PSK: 8 points (circle)
+static const int16_t psk8I[8] = {
+    (int16_t)(+1.000f * GAIN_I),  // 0°
+    (int16_t)(+0.707f * GAIN_I),  // 45°
+    (int16_t)(+0.000f * GAIN_I),  // 90°
+    (int16_t)(-0.707f * GAIN_I),  // 135°
+    (int16_t)(-1.000f * GAIN_I),  // 180°
+    (int16_t)(-0.707f * GAIN_I),  // 225°
+    (int16_t)(+0.000f * GAIN_I),  // 270°
+    (int16_t)(+0.707f * GAIN_I)   // 315°
 };
-static const int16_t psk8Q[8] =
-{
-    (int16_t)(+0.000f * GAIN_Q),    // 0 degrees
-    (int16_t)(+0.707f * GAIN_Q),    // 45 degrees
-    (int16_t)(+1.000f * GAIN_Q),    // 90 degrees
-    (int16_t)(+0.707f * GAIN_Q),    // 135 degrees
-    (int16_t)(+0.000f * GAIN_Q),    // 180 degrees
-    (int16_t)(-0.707f * GAIN_Q),    // 225 degrees
-    (int16_t)(-1.000f * GAIN_Q),    // 270 degrees
-    (int16_t)(-0.707f * GAIN_Q)     // 315 degrees
+static const int16_t psk8Q[8] = {
+    (int16_t)(+0.000f * GAIN_Q),  // 0°
+    (int16_t)(+0.707f * GAIN_Q),  // 45°
+    (int16_t)(+1.000f * GAIN_Q),  // 90°
+    (int16_t)(+0.707f * GAIN_Q),  // 135°
+    (int16_t)(+0.000f * GAIN_Q),  // 180°
+    (int16_t)(-0.707f * GAIN_Q),  // 225°
+    (int16_t)(-1.000f * GAIN_Q),  // 270°
+    (int16_t)(-0.707f * GAIN_Q)   // 315°
 };
 
-// 16QAM grid: I,Q e {-3,-1,+1,+3} (Gray-coded per axis)
+// 16QAM: 16 points (4x4 grid)
 #define QAM_SCALE_I (GAIN_I / 3)
 #define QAM_SCALE_Q (GAIN_Q / 3)
-static const int8_t gray2level[4] = { -3, -1, +3, +1 }; // 00->-3, 01->-1, 11->+3, 10->+1
+static const int8_t gray2level[4] = { -3, -1, +3, +1 };  // Gray-coded levels
 
-static inline int16_t qam16I_fromSym(uint8_t sym)
-{
+static inline int16_t qam16I_fromSym(uint8_t sym) {
     uint8_t iBits = (sym >> 2) & 0x3;
     return (int16_t)(gray2level[iBits] * QAM_SCALE_I);
 }
 
-static inline int16_t qam16Q_fromSym(uint8_t sym)
-{
+static inline int16_t qam16Q_fromSym(uint8_t sym) {
     uint8_t qBits = sym & 0x3;
     return (int16_t)(gray2level[qBits] * QAM_SCALE_Q);
 }
 
 //-----------------------------------------------------------------------------
-// Update rate calculations
+// Update symbol rate calculations
 //-----------------------------------------------------------------------------
-void updateRates(void)
+void updateSymbolRate(void)
 {
-    // Calculate actual sample rate from timer
-    uint32_t timer_load = TIMER1_TAILR_R + 1;
-    sampleRateHz = 80000000u / timer_load;
-
-    // Calculate samples per symbol
-    if (symbolRate > 0)
-        samplesPerSymbol = sampleRateHz / symbolRate;
+    if (symbolRate > 0 && symbolRate <= sampleRate)
+    {
+        samplesPerSymbol = sampleRate / symbolRate;
+        if (samplesPerSymbol < 1)
+            samplesPerSymbol = 1;
+    }
     else
-        samplesPerSymbol = 1000; // Default
-
-    // Reset counter
-    spsCount = samplesPerSymbol;
+    {
+        samplesPerSymbol = 250;  // Default
+    }
+    sampleCounter = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -155,48 +158,65 @@ void generateLUT()
     int i;
     for (i = 0; i < LUT_SIZE; i++)
     {
-        float angle = (2.0f * (float)PI * (float)i) / (float)LUT_SIZE;
-        cosine_LUT[i] = (int16_t)(cosf(angle) * (float)GAIN_I);
-        sine_LUT[i]   = (int16_t)(sinf(angle) * (float)GAIN_Q);
+        float angle = (2.0 * PI * i) / LUT_SIZE;
+        sine_LUT[i] = (int16_t)(sinf(angle) * GAIN_I);
+        cosine_LUT[i] = (int16_t)(cosf(angle) * GAIN_Q);
     }
 }
 
 //-----------------------------------------------------------------------------
-// Simple integer to string converter
+// Convert text to symbol stream
 //-----------------------------------------------------------------------------
-void intToStr(int32_t value, char* buffer)
+void textToSymbols(const char* text)
 {
-    int pos = 0;
-    int temp;
-    char rev[20];
-    int rpos = 0;
+    uint8_t bitsPerSymbol;
 
-    if (value == 0)
+    switch (modType)
     {
-        buffer[0] = '0';
-        buffer[1] = '\0';
-        return;
+        case MOD_BPSK:  bitsPerSymbol = 1; break;
+        case MOD_QPSK:  bitsPerSymbol = 2; break;
+        case MOD_8PSK:  bitsPerSymbol = 3; break;
+        case MOD_16QAM: bitsPerSymbol = 4; break;
+        default: bitsPerSymbol = 1;
     }
 
-    if (value < 0)
+    symbolCount = 0;
+    uint8_t bitBuffer = 0;
+    uint8_t bitCount = 0;
+
+    uint32_t i;
+    for (i = 0; text[i] != '\0' && symbolCount < STREAM_MAX; i++)
     {
-        buffer[pos++] = '-';
-        value = -value;
+        uint8_t c = (uint8_t)text[i];
+
+        // Process each bit (MSB first)
+        int8_t bit;
+        for (bit = 7; bit >= 0; bit--)
+        {
+            bitBuffer = (bitBuffer << 1) | ((c >> bit) & 0x01);
+            bitCount++;
+
+            if (bitCount == bitsPerSymbol)
+            {
+                symbolStream[symbolCount++] = bitBuffer;
+                bitBuffer = 0;
+                bitCount = 0;
+
+                if (symbolCount >= STREAM_MAX)
+                    break;
+            }
+        }
     }
 
-    temp = value;
-    while (temp > 0)
+    // Pad remaining bits if needed
+    if (bitCount > 0 && symbolCount < STREAM_MAX)
     {
-        rev[rpos++] = '0' + (temp % 10);
-        temp /= 10;
+        bitBuffer <<= (bitsPerSymbol - bitCount);
+        symbolStream[symbolCount++] = bitBuffer;
     }
 
-    while (rpos > 0)
-    {
-        buffer[pos++] = rev[--rpos];
-    }
-
-    buffer[pos] = '\0';
+    symbolIndex = 0;
+    sampleCounter = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -205,85 +225,87 @@ void intToStr(int32_t value, char* buffer)
 void timer1Isr()
 {
     uint16_t command;
-    int32_t dac_i = OFS_I;
-    int32_t dac_q = OFS_Q;
+    int32_t dac_i, dac_q;
+
+    // Toggle LDAC to latch data
+    LDAC = 0;
+    LDAC = 1;
 
     if (currentMode == MODE_SINE)
     {
-        // I = cosine, Q = sine
-        dac_i = cosine_LUT[lut_index] + OFS_I;
-        dac_q = sine_LUT[lut_index]   + OFS_Q;
+        // Generate sine wave using phase accumulator
+        uint8_t lut_index = phase_accumulator >> 24;
 
-        // Increment index for next sample
-        lut_index++;
-        if (lut_index >= LUT_SIZE)
-            lut_index = 0;
+        dac_i = cosine_LUT[lut_index] + OFS_I;
+        dac_q = sine_LUT[lut_index] + OFS_Q;
+
+        phase_accumulator += phase_increment;
     }
     else if (currentMode == MODE_STREAM)
     {
-        // Reload counter if needed
-        if (spsCount == 0)
-            spsCount = samplesPerSymbol;
+        // Digital modulation mode
 
-        // Load a NEW symbol only at the start of the hold period
-        if (spsCount == samplesPerSymbol)
+        // Time to load next symbol?
+        if (sampleCounter == 0)
         {
-            // Check if we have symbols to transmit
             if (symbolCount > 0)
             {
                 uint8_t sym = symbolStream[symbolIndex];
 
+                // Map symbol to constellation point
                 switch (modType)
                 {
                     case MOD_BPSK:
-                        stream_i = bpskI[sym & 0x01];  // Only use bit 0
-                        stream_q = bpskQ[sym & 0x01];
+                        current_i = bpskI[sym & 0x01];
+                        current_q = bpskQ[sym & 0x01];
                         break;
 
                     case MOD_QPSK:
-                        stream_i = qpskI[sym & 0x03];  // Use bits 0-1
-                        stream_q = qpskQ[sym & 0x03];
+                        current_i = qpskI[sym & 0x03];
+                        current_q = qpskQ[sym & 0x03];
                         break;
 
                     case MOD_8PSK:
-                        stream_i = psk8I[sym & 0x07];  // Use bits 0-2
-                        stream_q = psk8Q[sym & 0x07];
+                        current_i = psk8I[sym & 0x07];
+                        current_q = psk8Q[sym & 0x07];
                         break;
 
                     case MOD_16QAM:
-                        stream_i = qam16I_fromSym(sym & 0x0F);  // Use bits 0-3
-                        stream_q = qam16Q_fromSym(sym & 0x0F);
+                        current_i = qam16I_fromSym(sym & 0x0F);
+                        current_q = qam16Q_fromSym(sym & 0x0F);
                         break;
 
                     default:
-                        stream_i = 0;
-                        stream_q = 0;
+                        current_i = 0;
+                        current_q = 0;
                         break;
                 }
 
-                // Advance to next symbol (wrap)
+                // Advance to next symbol
                 symbolIndex++;
                 if (symbolIndex >= symbolCount)
                     symbolIndex = 0;
             }
             else
             {
-                // No symbols - output zero
-                stream_i = 0;
-                stream_q = 0;
+                current_i = 0;
+                current_q = 0;
             }
+
+            // Reset counter to hold this symbol
+            sampleCounter = samplesPerSymbol;
         }
 
-        // Decrement sample hold counter
-        spsCount--;
+        // Decrement counter
+        sampleCounter--;
 
-        // Output current symbol (baseband deviation + offset)
-        dac_i = stream_i + OFS_I;
-        dac_q = stream_q + OFS_Q;
+        // Output current symbol
+        dac_i = current_i + OFS_I;
+        dac_q = current_q + OFS_Q;
     }
     else
     {
-        // Static mode - use set values
+        // Static mode
         dac_i = i_value;
         dac_q = q_value;
     }
@@ -293,10 +315,6 @@ void timer1Isr()
     if (dac_i > 4095) dac_i = 4095;
     if (dac_q < 0) dac_q = 0;
     if (dac_q > 4095) dac_q = 4095;
-
-    // Toggle LDAC to latch data
-    LDAC = 0;
-    LDAC = 1;
 
     // Send I value to DAC A
     command = DAC_A | (dac_i & 0x0FFF);
@@ -312,66 +330,6 @@ void timer1Isr()
     TIMER1_ICR_R = TIMER_ICR_TATOCINT;
 }
 
-//-----------------------------------------------------------------------------
-// Convert text string to symbol stream
-//-----------------------------------------------------------------------------
-void textToSymbols(const char* text)
-{
-    uint8_t bitsPerSymbol;
-
-    // Determine bits per symbol
-    switch (modType)
-    {
-        case MOD_BPSK:  bitsPerSymbol = 1; break;
-        case MOD_QPSK:  bitsPerSymbol = 2; break;
-        case MOD_8PSK:  bitsPerSymbol = 3; break;
-        case MOD_16QAM: bitsPerSymbol = 4; break;
-        default: bitsPerSymbol = 1;
-    }
-
-    symbolCount = 0;
-    uint8_t bitBuffer = 0;
-    uint8_t bitCount = 0;
-
-    // Convert each character to bits, then pack into symbols
-    uint32_t i;
-    for (i = 0; text[i] != '\0' && symbolCount < STREAM_MAX; i++)
-    {
-        uint8_t c = (uint8_t)text[i];
-
-        // Process each bit in the character (MSB first)
-        int8_t bit;
-        for (bit = 7; bit >= 0; bit--)
-        {
-            // Extract bit
-            bitBuffer = (bitBuffer << 1) | ((c >> bit) & 0x01);
-            bitCount++;
-
-            // When we have enough bits for a symbol, store it
-            if (bitCount == bitsPerSymbol)
-            {
-                symbolStream[symbolCount++] = bitBuffer;
-                bitBuffer = 0;
-                bitCount = 0;
-
-                if (symbolCount >= STREAM_MAX)
-                    break;
-            }
-        }
-    }
-
-    // If there are leftover bits, pad and store
-    if (bitCount > 0 && symbolCount < STREAM_MAX)
-    {
-        // Pad with zeros
-        bitBuffer <<= (bitsPerSymbol - bitCount);
-        symbolStream[symbolCount++] = bitBuffer;
-    }
-
-    // Reset symbol index
-    symbolIndex = 0;
-    spsCount = samplesPerSymbol;
-}
 
 //-----------------------------------------------------------------------------
 // Command Handler
@@ -405,9 +363,12 @@ void handleCommand()
     else if (isCommand(&data, "sine", 0))
     {
         currentMode = MODE_SINE;
-        lut_index = 0;
-        putsUart0("\rSwitched to SINE wave mode\n");
-        putsUart0("\rI = cosine, Q = sine\n");
+        phase_accumulator = 0;
+        phase_increment = 10000 * 17180;  // 10 kHz
+        TIMER1_TAILR_R = 320;  // 250 kHz sample rate
+
+        putsUart0("\rSwitched to SINE wave mode (10 kHz)\n");
+        putsUart0("\rI = cosine (0°), Q = sine (90°)\n");
     }
     else if (isCommand(&data, "static", 0))
     {
@@ -471,7 +432,7 @@ void handleCommand()
     }
     else if (isCommand(&data, "freq", 1))
     {
-        uint32_t freq = (uint32_t)getFieldInteger(&data, 1);
+        uint32_t freq = getFieldInteger(&data, 1);
 
         if (freq < 1 || freq > 100000)
         {
@@ -479,22 +440,14 @@ void handleCommand()
             return;
         }
 
-        uint32_t sample_rate = freq * LUT_SIZE;
-        uint32_t timer_load = 80000000u / sample_rate;
-
-        if (timer_load < 2) timer_load = 2;
-
-        TIMER1_TAILR_R = timer_load - 1;
-
-        // Update stream timing
-        updateRates();
+        phase_increment = freq * 17180;
 
         putsUart0("\rFrequency set to: ");
-        intToStr((int32_t)freq, buffer);
+        intToStr(freq, buffer);
         putsUart0(buffer);
         putsUart0(" Hz\n");
     }
-    // -------------------- Modulation Commands --------------------
+    // ========== Digital Modulation Commands ==========
     else if (isCommand(&data, "mod", 1))
     {
         char *m = getFieldString(&data, 1);
@@ -515,7 +468,7 @@ void handleCommand()
     }
     else if (isCommand(&data, "sym", 1))
     {
-        uint32_t rate = (uint32_t)getFieldInteger(&data, 1);
+        uint32_t rate = getFieldInteger(&data, 1);
 
         if (rate < 1 || rate > 100000)
         {
@@ -524,15 +477,14 @@ void handleCommand()
         }
 
         symbolRate = rate;
-        updateRates();
+        updateSymbolRate();
 
         putsUart0("\rSymbol rate set to: ");
-        intToStr((int32_t)symbolRate, buffer);
+        intToStr(symbolRate, buffer);
         putsUart0(buffer);
         putsUart0(" symbols/sec\n");
-
         putsUart0("\r(Samples per symbol: ");
-        intToStr((int32_t)samplesPerSymbol, buffer);
+        intToStr(samplesPerSymbol, buffer);
         putsUart0(buffer);
         putsUart0(")\n");
     }
@@ -540,34 +492,31 @@ void handleCommand()
     {
         char* text = getFieldString(&data, 1);
 
-        // Convert text to symbols
         textToSymbols(text);
-
-        // Switch to stream mode
         currentMode = MODE_STREAM;
-        symbolIndex = 0;
-        spsCount = samplesPerSymbol;
+        sampleCounter = 0;
 
-        putsUart0("\rStream loaded: ");
-        intToStr((int32_t)symbolCount, buffer);
+        putsUart0("\rStream loaded: \"");
+        putsUart0(text);
+        putsUart0("\" (");
+        intToStr(symbolCount, buffer);
         putsUart0(buffer);
-        putsUart0(" symbols\n");
+        putsUart0(" symbols)\n");
     }
-    // -------------------- Help --------------------
+    // ========== Help ==========
     else if (isCommand(&data, "help", 0))
     {
-        putsUart0("\r\n=== CSE-4377 Lab 1 Commands ===\n");
-        putsUart0("\rset <I> <Q>  - Set both channels (0-4095)\n");
-        putsUart0("\ri <value>    - Set I channel only (0-4095)\n");
-        putsUart0("\rq <value>    - Set Q channel only (0-4095)\n");
-        putsUart0("\rmid          - Set to calibrated mid-scale\n");
-        putsUart0("\rmin          - Set to minimum (0, 0)\n");
-        putsUart0("\rmax          - Set to maximum (4095, 4095)\n");
-        putsUart0("\rsine         - Sine tone (I=cos, Q=sin)\n");
-        putsUart0("\rstatic       - Return to static mode\n");
-        putsUart0("\rfreq <Hz>    - Set sine frequency (1-100000 Hz)\n");
-        putsUart0("\rstart        - Start DAC output\n");
-        putsUart0("\rstop         - Stop DAC output\n");
+        putsUart0("\r\n=== CSE-4377 Lab 1 Commands ===\n\n");
+        putsUart0("\r--- Static & Sine Mode ---\n");
+        putsUart0("\rset <I> <Q>   - Set both channels (0-4095)\n");
+        putsUart0("\ri <value>     - Set I channel only\n");
+        putsUart0("\rq <value>     - Set Q channel only\n");
+        putsUart0("\rmid           - Set to calibrated mid-scale\n");
+        putsUart0("\rmin           - Set to minimum (0, 0)\n");
+        putsUart0("\rmax           - Set to maximum (4095, 4095)\n");
+        putsUart0("\rsine          - Generate 10 kHz sine wave\n");
+        putsUart0("\rfreq <Hz>     - Set sine frequency (1-100000 Hz)\n");
+        putsUart0("\rstatic        - Return to static mode\n");
 
         putsUart0("\r\n--- Digital Modulation ---\n");
         putsUart0("\rmod <type>    - Set modulation (bpsk|qpsk|psk8|qam16)\n");
@@ -575,24 +524,28 @@ void handleCommand()
         putsUart0("\rstream <text> - Load text and start streaming\n");
         putsUart0("\r                Example: stream Hello\n");
 
-        putsUart0("\r\nCalibration values:\n");
-        putsUart0("\r  GAIN_I=");
+        putsUart0("\r\n--- Control ---\n");
+        putsUart0("\rstart         - Start DAC output\n");
+        putsUart0("\rstop          - Stop DAC output\n");
+        putsUart0("\rhelp          - Show this help\n");
+
+        putsUart0("\r\nCalibration: GAIN_I=");
         intToStr(GAIN_I, buffer);
         putsUart0(buffer);
         putsUart0(", GAIN_Q=");
         intToStr(GAIN_Q, buffer);
         putsUart0(buffer);
-        putsUart0("\r\n  OFS_I=");
+        putsUart0(", OFS_I=");
         intToStr(OFS_I, buffer);
         putsUart0(buffer);
         putsUart0(", OFS_Q=");
         intToStr(OFS_Q, buffer);
         putsUart0(buffer);
-        putsUart0("\r\n\n");
+        putsUart0("\n\n");
     }
     else
     {
-        putsUart0("\rUnknown command. Type 'help' for options.\n");
+        putsUart0("\rUnknown command. Type 'help'\n");
     }
 }
 
@@ -609,15 +562,13 @@ void initHW()
     enablePort(PORTC);
     enablePort(PORTD);
 
-    // Enable Timer
-    // For 10 kHz sine wave with 256-point LUT, we need 2.56 MHz sample rate
-    // Timer period = 80MHz / 2.56MHz = 31.25 = 31
-    TIMER1_CTL_R &= ~TIMER_CTL_TAEN;                 // Turn off timer
-    TIMER1_CFG_R = TIMER_CFG_32_BIT_TIMER;           // 32-bit timer
-    TIMER1_TAMR_R = TIMER_TAMR_TAMR_PERIOD;          // Periodic mode
-    TIMER1_TAILR_R = 31;                             // 2.58 MHz sample rate
-    TIMER1_IMR_R = TIMER_IMR_TATOIM;                 // Enable interrupts
-    NVIC_EN0_R = 1 << (INT_TIMER1A-16);              // Enable interrupt 37
+    // Enable Timer - 250 kHz sample rate
+    TIMER1_CTL_R &= ~TIMER_CTL_TAEN;
+    TIMER1_CFG_R = TIMER_CFG_32_BIT_TIMER;
+    TIMER1_TAMR_R = TIMER_TAMR_TAMR_PERIOD;
+    TIMER1_TAILR_R = 320;  // 80 MHz / 320 = 250 kHz
+    TIMER1_IMR_R = TIMER_IMR_TATOIM;
+    NVIC_EN0_R = 1 << (INT_TIMER1A-16);
 
     // Configure LDAC pin
     selectPinPushPullOutput(PORTC, 4);
@@ -626,8 +577,8 @@ void initHW()
     initSpi1(USE_SSI_FSS);
     setSpi1BaudRate(FDAC, 80e6);
 
-    // Calculate initial rates
-    updateRates();
+    // Initialize symbol rate
+    updateSymbolRate();
 }
 
 //-----------------------------------------------------------------------------
@@ -648,12 +599,10 @@ int main(void)
     putsUart0("\r========================================\n");
     putsUart0("\r  CSE-4377 Lab 1 - IQ Modulation\n");
     putsUart0("\r========================================\n");
-    putsUart0("\r\nType 'help' for available commands\n");
-    putsUart0("\r\nQuick start:\n");
-    putsUart0("\r  1. mod qpsk\n");
-    putsUart0("\r  2. sym 1000\n");
-    putsUart0("\r  3. stream Hello\n");
-    putsUart0("\r  4. start\n\n");
+    putsUart0("\r\nQuick Start:\n");
+    putsUart0("\r  Sine:    sine, start\n");
+    putsUart0("\r  Digital: mod qpsk, sym 1000, stream Hello, start\n");
+    putsUart0("\r\nType 'help' for all commands\n\n");
 
     // Main loop
     while (true)
