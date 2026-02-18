@@ -46,6 +46,10 @@ typedef enum {
 
 OperationMode currentMode = MODE_STATIC;
 
+// Phase accumulator for precise frequency control
+uint32_t phase_accumulator = 0;  // 32-bit accumulator
+uint32_t phase_increment = 0;    // How much to add each sample
+
 USER_DATA data;
 
 // Sine wave lookup table
@@ -87,13 +91,18 @@ void timer1Isr()
 
     if (currentMode == MODE_SINE)
     {
-        // Generate sine wave
+        // Generate sine wave using phase accumulator
+        // Upper 8 bits of phase_accumulator index into 256-entry LUT
+        uint8_t lut_index = phase_accumulator >> 24;
+
         // I channel gets cosine (In-phase, 0°)
         // Q channel gets sine (Quadrature, 90°)
-        i_value = sine_LUT[lut_index];
-        q_value = cosine_LUT[lut_index];
-        lut_index = (lut_index + 1) % LUT_SIZE;
+        dac_i = cosine_LUT[lut_index] + OFS_I;
+        dac_q = sine_LUT[lut_index] + OFS_Q;
 
+        // Increment phase accumulator
+        phase_accumulator += phase_increment;
+        // Automatically wraps at 2^32
     }
     else
     {
@@ -111,17 +120,54 @@ void timer1Isr()
     // Send I value to DAC A
     command = DAC_A | (dac_i & 0x0FFF);
     SSI1_DR_R = command;
-
+    while (SSI1_SR_R & SSI_SR_BSY);
 
     // Send Q value to DAC B
     command = DAC_B | (dac_q & 0x0FFF);
     SSI1_DR_R = command;
-
+    while (SSI1_SR_R & SSI_SR_BSY);
 
     // Clear interrupt flag
     TIMER1_ICR_R = TIMER_ICR_TATOCINT;
 }
 
+//-----------------------------------------------------------------------------
+// Simple integer to string converter
+//-----------------------------------------------------------------------------
+void intToStr(int32_t value, char* buffer)
+{
+    int pos = 0;
+    int temp;
+    char rev[20];
+    int rpos = 0;
+
+    if (value == 0)
+    {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+
+    if (value < 0)
+    {
+        buffer[pos++] = '-';
+        value = -value;
+    }
+
+    temp = value;
+    while (temp > 0)
+    {
+        rev[rpos++] = '0' + (temp % 10);
+        temp /= 10;
+    }
+
+    while (rpos > 0)
+    {
+        buffer[pos++] = rev[--rpos];
+    }
+
+    buffer[pos] = '\0';
+}
 
 //-----------------------------------------------------------------------------
 // Command Handler
@@ -159,7 +205,14 @@ void handleCommand()
     {
         // Command: sine - Generate 10 kHz sine wave
         currentMode = MODE_SINE;
-        lut_index = 0;
+        phase_accumulator = 0;
+
+        // Calculate phase increment for 10 kHz
+        // phase_increment = (10000 × 2^32) / 250000
+        // = 10000 × 17180 = 171,800,000
+        phase_increment = 10000 * 17180;
+
+        TIMER1_TAILR_R = 320;  // 250 kHz sample rate
         putsUart0("\rSwitched to SINE wave mode (10 kHz)\n");
         putsUart0("\rI = cosine (0 deg), Q = sine (90 deg)\n");
     }
@@ -233,20 +286,39 @@ void handleCommand()
     }
     else if (isCommand(&data, "freq", 1))
     {
-        // Command: freq <Hz> - Set output frequency
-        // Calculate samples per cycle
-        // Timer runs at 10 kHz (configured in initHW)
-        // For 10 kHz output, we need all 256 samples in one cycle
-        // Timer freq = 10000 Hz, want output freq = 10000 Hz
-        // So we output 256 samples at 2.56 MHz sample rate
+        // Command: freq <Hz> - Set output frequency using phase accumulator
+        uint32_t freq = getFieldInteger(&data, 1);
 
-        // Actually, for 10 kHz sine with 256-point LUT:
-        // Sample rate needed = 10000 * 256 = 2.56 MHz
-        // Timer period = 80MHz / 2.56MHz = 31.25
+        // Phase accumulator method:
+        // Sample rate = 250 kHz (fixed)
+        // Phase increment = (Desired freq × 2^32) / Sample rate
+        // LUT index = phase_accumulator >> 24 (top 8 bits)
 
-        TIMER1_TAILR_R = 80e6 / getFieldInteger(&data, 1);
+        uint32_t sample_rate = 250000;  // 250 kHz
+
+        if (freq < 1 || freq > 100000)
+        {
+            putsUart0("\rFrequency must be 1-100000 Hz\n");
+            return;
+        }
+
+        // Calculate phase increment
+        // phase_increment = (freq × 2^32) / sample_rate
+        // To avoid overflow, rearrange: (freq × (2^32 / sample_rate))
+        // 2^32 / 250000 = 17179.869 = 17180
+        phase_increment = freq * 17180;
 
         putsUart0("\rFrequency set to: ");
+        intToStr(freq, buffer);
+        putsUart0(buffer);
+        putsUart0(" Hz\n");
+
+        // Calculate and show actual frequency
+        uint32_t actual_freq = (phase_increment / 17180);
+        putsUart0("\r(Actual: ");
+        intToStr(actual_freq, buffer);
+        putsUart0(buffer);
+        putsUart0(" Hz)\n");
     }
     else if (isCommand(&data, "help", 0))
     {
@@ -298,12 +370,12 @@ void initHW()
     enablePort(PORTD);
 
     // Enable Timer
-    // For 10 kHz sine wave with 256-point LUT, we need 2.56 MHz sample rate
-    // Timer period = 80MHz / 2.56MHz = 31.25  31
+    // For sine wave generation, use fixed 250 kHz sample rate
+    // Timer period = 80MHz / 250kHz = 320
     TIMER1_CTL_R &= ~TIMER_CTL_TAEN;                 // Turn off timer
     TIMER1_CFG_R = TIMER_CFG_32_BIT_TIMER;           // 32-bit timer
     TIMER1_TAMR_R = TIMER_TAMR_TAMR_PERIOD;          // Periodic mode
-    TIMER1_TAILR_R = 31;                             // 2.58 MHz sample rate (for 10.08 kHz output)
+    TIMER1_TAILR_R = 320;                            // 250 kHz sample rate
     TIMER1_IMR_R = TIMER_IMR_TATOIM;                 // Enable interrupts
     NVIC_EN0_R = 1 << (INT_TIMER1A-16);              // Enable interrupt 37
 
