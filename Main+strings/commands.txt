@@ -1,0 +1,15 @@
+Example test to try:
+
+# Test sine
+> sine
+> start
+
+# Test QPSK
+> mod qpsk
+> stream ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
+> start
+
+# Test all 16-QAM points
+> mod qam16
+> constellation
+> start
